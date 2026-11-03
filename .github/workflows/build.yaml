@@ -16,14 +16,6 @@ jobs:
     - uses: nuget/setup-nuget@v1
       with:
         nuget-version: latest
-    - uses: actions/setup-python@v1
-      with:
-        python-version: 3.7
-    - run: |
-        cd translate
-        pip install -r requirements.txt
-        ./gen_rc.sh
-      shell: bash
     - run: nuget restore AudioPlaybackConnector.sln
     - run: |
         Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
