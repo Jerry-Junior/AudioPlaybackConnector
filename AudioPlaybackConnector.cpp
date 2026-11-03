@@ -8,6 +8,8 @@ winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+void ShowDevicePicker();
+void ActivateExistingInstance();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -19,6 +21,29 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	UNREFERENCED_PARAMETER(nCmdShow);
 
 	g_hInst = hInstance;
+
+	// Single-instance gate: the mutex only has to exist, ownership is never taken.
+	// The handle lives until wWinMain returns; the kernel releases it on process exit
+	// (including crashes or a forced kill), so no stale lock can be left behind.
+	// The Local\ namespace gives one instance per logon session, so multiple users and
+	// Remote Desktop sessions do not interfere. Never use Global\: another session would
+	// be blocked while FindWindow cannot see its window, making the app look dead.
+	HANDLE mutexRaw = CreateMutexW(nullptr, FALSE, SINGLE_INSTANCE_MUTEX_NAME);
+	const DWORD mutexError = GetLastError(); // must be read immediately after CreateMutexW
+	wil::unique_handle singleInstanceMutex(mutexRaw);
+	if (!singleInstanceMutex)
+	{
+		// Could not open an existing mutex (for example due to an ACL): treat it as
+		// "already running" and never start a second instance.
+		LOG_LAST_ERROR();
+		return EXIT_SUCCESS;
+	}
+	if (mutexError == ERROR_ALREADY_EXISTS)
+	{
+		// Another instance is running: let it show the device picker as visible feedback.
+		ActivateExistingInstance();
+		return EXIT_SUCCESS;
+	}
 
 	winrt::init_apartment();
 
@@ -37,7 +62,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	}
 	if (!supported)
 	{
-		TaskDialog(nullptr, nullptr, _(L"Unsupported Operating System"), nullptr, _(L"AudioPlaybackConnector is not supported on this operating system version."), TDCBF_OK_BUTTON, TD_ERROR_ICON, nullptr);
+		TaskDialog(nullptr, nullptr, L"Unsupported Operating System", nullptr, L"AudioPlaybackConnector is not supported on this operating system version.", TDCBF_OK_BUTTON, TD_ERROR_ICON, nullptr);
 		return EXIT_FAILURE;
 	}
 
@@ -47,14 +72,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		.hInstance = hInstance,
 		.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_AUDIOPLAYBACKCONNECTOR)),
 		.hCursor = LoadCursorW(nullptr, IDC_ARROW),
-		.lpszClassName = L"AudioPlaybackConnector",
+		.lpszClassName = WINDOW_CLASS_NAME,
 		.hIconSm = wcex.hIcon
 	};
 
 	RegisterClassExW(&wcex);
 
 	// When parent window size is 0x0 or invisible, the dpi scale of menu is incorrect. Here we set window size to 1x1 and use WS_EX_LAYERED to make window looks like invisible.
-	g_hWnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST, L"AudioPlaybackConnector", nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
+	g_hWnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST, WINDOW_CLASS_NAME, nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
 	FAIL_FAST_LAST_ERROR_IF_NULL(g_hWnd);
 	FAIL_FAST_IF_WIN32_BOOL_FALSE(SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA));
 
@@ -73,7 +98,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	SetupSvgIcon();
 
 	g_nid.hWnd = g_niid.hWnd = g_hWnd;
-	wcscpy_s(g_nid.szTip, _(L"AudioPlaybackConnector"));
+	wcscpy_s(g_nid.szTip, L"AudioPlaybackConnector");
 	UpdateNotifyIcon();
 
 	WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
@@ -101,24 +126,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	case WM_DESTROY:
-		for (const auto& connection : g_audioPlaybackConnections)
+	{
+		// In reconnect mode save first: SaveSettings reads the device ids from the table.
+		if (g_reconnect)
+		{
+			SaveSettings();
+		}
+
+		// Do not Close() while iterating the map: Close() may raise StateChanged
+		// synchronously, and the handler erases the current element, invalidating the
+		// iterator (UB). Move the table out and clear it first, so the handler's lookup
+		// always fails and it never touches the container.
+		auto connections = std::move(g_audioPlaybackConnections);
+		g_audioPlaybackConnections.clear();
+
+		for (auto& connection : connections)
 		{
 			connection.second.second.Close();
 			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
-		if (g_reconnect)
+
+		if (!g_reconnect)
 		{
-			SaveSettings();
-			g_audioPlaybackConnections.clear();
+			SaveSettings(); // not reconnecting: write an empty lastDevices list
 		}
-		else
-		{
-			g_audioPlaybackConnections.clear();
-			SaveSettings();
-		}
+
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
 		break;
+	}
 	case WM_SETTINGCHANGE:
 		if (lParam && CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL)
 		{
@@ -130,30 +166,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 		case NIN_SELECT:
 		case NIN_KEYSELECT:
-		{
-			using namespace winrt::Windows::UI::Popups;
-
-			RECT iconRect;
-			auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
-			if (FAILED(hr))
-			{
-				LOG_HR(hr);
-				break;
-			}
-
-			auto dpi = GetDpiForWindow(hWnd);
-			Rect rect = {
-				static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
-			};
-
-			SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
-			SetForegroundWindow(hWnd);
-			g_devicePicker.Show(rect, Placement::Above);
-		}
-		break;
+			ShowDevicePicker();
+			break;
 		case WM_RBUTTONUP: // Menu activated by mouse click
 			g_menuFocusState = FocusState::Pointer;
 			break;
@@ -177,6 +191,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 		}
 		break;
+	case WM_SHOWDEVICEPICKER:
+		ShowDevicePicker();
+		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
 		{
@@ -197,18 +214,78 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return 0;
 }
 
+void ShowDevicePicker()
+{
+	using namespace winrt::Windows::UI::Popups;
+
+	RECT iconRect;
+	auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
+	if (FAILED(hr))
+	{
+		LOG_HR(hr);
+		return;
+	}
+
+	auto dpi = GetDpiForWindow(g_hWnd);
+	Rect rect = {
+		static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
+		static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
+		static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
+		static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
+	};
+
+	SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
+	SetForegroundWindow(g_hWnd);
+
+	try
+	{
+		g_devicePicker.Show(rect, Placement::Above);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// Show() throws if the picker is already open; letting it escape WndProc would
+		// terminate the process.
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+void ActivateExistingInstance()
+{
+	// The second instance only wakes up the existing one, then exits.
+	HWND existing = nullptr;
+	for (int i = 0; i < 10 && !existing; ++i)
+	{
+		// Covers the race where both instances start almost simultaneously and the
+		// window does not exist yet.
+		existing = FindWindowW(WINDOW_CLASS_NAME, nullptr);
+		if (!existing)
+		{
+			Sleep(50);
+		}
+	}
+	if (!existing)
+	{
+		return;
+	}
+
+	DWORD pid = 0;
+	GetWindowThreadProcessId(existing, &pid);
+	AllowSetForegroundWindow(pid);
+	PostMessageW(existing, WM_SHOWDEVICEPICKER, 0, 0);
+}
+
 void SetupFlyout()
 {
 	TextBlock textBlock;
-	textBlock.Text(_(L"All connections will be closed.\nExit anyway?"));
+	textBlock.Text(L"All connections will be closed.\nExit anyway?");
 	textBlock.Margin({ 0, 0, 0, 12 });
 
 	static CheckBox checkbox;
 	checkbox.IsChecked(g_reconnect);
-	checkbox.Content(winrt::box_value(_(L"Reconnect on next start")));
+	checkbox.Content(winrt::box_value(L"Reconnect on next start"));
 
 	Button button;
-	button.Content(winrt::box_value(_(L"Exit")));
+	button.Content(winrt::box_value(L"Exit"));
 	button.HorizontalAlignment(HorizontalAlignment::Right);
 	button.Click([](const auto&, const auto&) {
 		g_reconnect = checkbox.IsChecked().Value();
@@ -234,7 +311,7 @@ void SetupMenu()
 	settingsIcon.Glyph(L"\xE713");
 
 	MenuFlyoutItem settingsItem;
-	settingsItem.Text(_(L"Bluetooth Settings"));
+	settingsItem.Text(L"Bluetooth Settings");
 	settingsItem.Icon(settingsIcon);
 	settingsItem.Click([](const auto&, const auto&) {
 		winrt::Windows::System::Launcher::LaunchUriAsync(Uri(L"ms-settings:bluetooth"));
@@ -244,7 +321,7 @@ void SetupMenu()
 	closeIcon.Glyph(L"\xE8BB");
 
 	MenuFlyoutItem exitItem;
-	exitItem.Text(_(L"Exit"));
+	exitItem.Text(L"Exit");
 	exitItem.Icon(closeIcon);
 	exitItem.Click([](const auto&, const auto&) {
 		if (g_audioPlaybackConnections.size() == 0)
@@ -291,7 +368,14 @@ void SetupMenu()
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
-	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	if (g_audioPlaybackConnections.find(std::wstring(device.Id())) != g_audioPlaybackConnections.end())
+	{
+		// Already connecting or connected: reuse the existing session. Creating a second
+		// connection object would let the failure path close the old one.
+		co_return;
+	}
+
+	picker.SetDisplayStatus(device, L"Connecting", DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
 	bool success = false;
 	std::wstring errorMessage;
@@ -326,11 +410,11 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
 				success = false;
-				errorMessage = _(L"The request timed out");
+				errorMessage = L"The request timed out";
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::DeniedBySystem:
 				success = false;
-				errorMessage = _(L"The operation was denied by the system");
+				errorMessage = L"The operation was denied by the system";
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
 				success = false;
@@ -341,7 +425,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		else
 		{
 			success = false;
-			errorMessage = _(L"Unknown error");
+			errorMessage = L"Unknown error";
 		}
 	}
 	catch (winrt::hresult_error const& ex)
@@ -366,7 +450,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 	if (success)
 	{
-		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		picker.SetDisplayStatus(device, L"Connected", DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 	}
 	else
 	{
@@ -382,8 +466,22 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
 {
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-	ConnectDevice(picker, device);
+	DeviceInformation device = nullptr;
+	try
+	{
+		device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// The device may have been removed or unpaired; the exception must not escape a
+		// fire_and_forget coroutine (that terminates the process).
+		LOG_CAUGHT_EXCEPTION();
+	}
+
+	if (device)
+	{
+		ConnectDevice(picker, device);
+	}
 }
 
 void SetupDevicePicker()

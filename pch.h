@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include <filesystem>
 
 // wil
@@ -32,6 +34,7 @@
 
 #include <wil/common.h>
 #include <wil/result.h>
+#include <wil/resource.h>
 #include <wil/cppwinrt.h>
 
 // C++/WinRT
