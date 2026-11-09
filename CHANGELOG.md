@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 This file starts at 1.3.2. Earlier versions were released by the upstream project
 [ysc3839/AudioPlaybackConnector](https://github.com/ysc3839/AudioPlaybackConnector).
 
+## [1.3.3] - 2026-11-09
+
+### Fixed
+- Disconnecting a device from the picker (and cleaning up a failed connection attempt)
+  could erase a dangling iterator in `g_audioPlaybackConnections`. Closing an
+  `AudioPlaybackConnection` raises `StateChanged(Closed)` synchronously, and that handler
+  removes the device from the table; the caller then erased the same, now invalidated,
+  iterator (undefined behavior). The entry is now detached from the table before the
+  connection is closed, so the handler's lookup fails instead of erasing it a second time.
+
+### Notes
+- Disconnecting one of several simultaneously connected devices still disconnects all of
+  them. This was reproduced after the fix above: the app only closes the connection of the
+  selected device, so the propagation happens inside the Windows A2DP sink stack, which
+  does not expose per-device teardown through `AudioPlaybackConnection`.
+
 ## [1.3.2] - 2026-11-03
 
 ### Added

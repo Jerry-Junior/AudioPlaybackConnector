@@ -10,6 +10,7 @@ void SetupSvgIcon();
 void UpdateNotifyIcon();
 void ShowDevicePicker();
 void ActivateExistingInstance();
+void RemoveAudioPlaybackConnection(std::wstring const& deviceId);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -366,6 +367,24 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
+// Removes the tracked session for a device and then closes it. Close() raises StateChanged
+// synchronously, and that handler also removes the entry by device id, so the entry must be
+// detached from the table before Close() is called; otherwise the handler erases it and the
+// caller's iterator is left dangling (undefined behavior: use-after-free of the map node,
+// possible heap corruption). The same hazard is documented in WM_DESTROY.
+void RemoveAudioPlaybackConnection(std::wstring const& deviceId)
+{
+	auto it = g_audioPlaybackConnections.find(deviceId);
+	if (it == g_audioPlaybackConnections.end())
+	{
+		return;
+	}
+
+	AudioPlaybackConnection connection = it->second.second;
+	g_audioPlaybackConnections.erase(it);
+	connection.Close();
+}
+
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
 	if (g_audioPlaybackConnections.find(std::wstring(device.Id())) != g_audioPlaybackConnections.end())
@@ -454,12 +473,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	}
 	else
 	{
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-		if (it != g_audioPlaybackConnections.end())
-		{
-			it->second.second.Close();
-			g_audioPlaybackConnections.erase(it);
-		}
+		RemoveAudioPlaybackConnection(std::wstring(device.Id()));
 		picker.SetDisplayStatus(device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
 	}
 }
@@ -498,12 +512,7 @@ void SetupDevicePicker()
 	});
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-		if (it != g_audioPlaybackConnections.end())
-		{
-			it->second.second.Close();
-			g_audioPlaybackConnections.erase(it);
-		}
+		RemoveAudioPlaybackConnection(std::wstring(device.Id()));
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 	});
 }
