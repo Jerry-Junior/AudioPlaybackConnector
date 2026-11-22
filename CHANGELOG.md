@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 This file starts at 1.3.2. Earlier versions were released by the upstream project
 [ysc3839/AudioPlaybackConnector](https://github.com/ysc3839/AudioPlaybackConnector).
 
+## [1.3.4] - 2026-11-22
+
+### Added
+- A "Reconnect" item in the tray context menu. It closes every active connection and
+  reconnects the same devices one second later; this is the workaround for the
+  "connected but silent" state (a connection established while the phone is already
+  playing may stay silent even though audio reaches the PC). Closing tears the AVDTP
+  session down (the phone pauses its playback), and the fresh connection starts a new
+  stream that reaches the output device.
+- The item is disabled while nothing is connected or a reconnect is already in flight,
+  and the affected devices show "Reconnecting" while the old stream is torn down.
+
+### Changed
+- The reconnect delay resumes on the UI thread before the device picker or the connection
+  table is touched again, so the connection table is never accessed from two threads.
+- Each connection session carries an id: a late `StateChanged` event or a late
+  failed-connect cleanup can no longer remove a newer session for the same device.
+
 ## [1.3.3] - 2026-11-09
 
 ### Fixed

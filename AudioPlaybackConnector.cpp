@@ -5,12 +5,15 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
 winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
+winrt::fire_and_forget ConnectDevice(DevicePicker, DeviceInformation);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void ShowDevicePicker();
 void ActivateExistingInstance();
 void RemoveAudioPlaybackConnection(std::wstring const& deviceId);
+void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options);
+winrt::fire_and_forget ReconnectAll();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -128,6 +131,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 	{
+		// Stop a pending reconnect from touching the app state once shutdown has started.
+		g_shuttingDown = true;
+		g_reconnecting = false;
+
 		// In reconnect mode save first: SaveSettings reads the device ids from the table.
 		if (g_reconnect)
 		{
@@ -143,8 +150,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		for (auto& connection : connections)
 		{
-			connection.second.second.Close();
-			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
+			connection.second.Connection.Close();
+			SetDeviceDisplayStatus(g_devicePicker, connection.second.Device, {}, DevicePickerDisplayStatusOptions::None);
 		}
 
 		if (!g_reconnect)
@@ -305,9 +312,91 @@ void SetupFlyout()
 	g_xamlFlyout = flyout;
 }
 
+void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options)
+{
+	// The picker is agile, but a throwing status update must not escape a fire_and_forget
+	// coroutine: an unhandled hresult_error there terminates the process.
+	try
+	{
+		picker.SetDisplayStatus(device, winrt::hstring(status), options);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+// Closes every active connection and reconnects the same devices after a short delay.
+// This is the workaround for the "connected but silent" state: the close makes the phone
+// see an A2DP disconnect (its playback pauses) and tears down the whole AVDTP session,
+// and the reconnect starts a completely fresh one whose stream reaches the output device.
+winrt::fire_and_forget ReconnectAll()
+{
+	if (g_shuttingDown || g_reconnecting || g_audioPlaybackConnections.empty())
+	{
+		co_return;
+	}
+
+	g_reconnecting = true;
+	auto reconnectGuard = wil::scope_exit([] { g_reconnecting = false; });
+
+	// Captured on the UI thread: resume_after() resumes on a thread-pool thread, and the
+	// picker and the connection table must only be touched from the UI thread again.
+	winrt::apartment_context uiContext;
+
+	std::vector<DeviceInformation> devices;
+	try
+	{
+		devices.reserve(g_audioPlaybackConnections.size());
+		for (const auto& entry : g_audioPlaybackConnections)
+		{
+			devices.push_back(entry.second.Device);
+		}
+
+		for (const auto& device : devices)
+		{
+			SetDeviceDisplayStatus(g_devicePicker, device, L"Reconnecting", DevicePickerDisplayStatusOptions::ShowProgress);
+			RemoveAudioPlaybackConnection(std::wstring(device.Id()));
+		}
+
+		// Give the phone time to notice the disconnect (and pause its media) and the audio
+		// engine time to tear the old stream down before the fresh connection is opened.
+		co_await winrt::resume_after(RECONNECT_SETTLE_DELAY);
+		co_await uiContext;
+
+		if (g_shuttingDown)
+		{
+			co_return;
+		}
+
+		for (const auto& device : devices)
+		{
+			ConnectDevice(g_devicePicker, device);
+		}
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	catch (...)
+	{
+		// A fire_and_forget coroutine must not let any exception escape.
+	}
+}
+
 void SetupMenu()
 {
 	// https://docs.microsoft.com/en-us/windows/uwp/design/style/segoe-ui-symbol-font
+	FontIcon reconnectIcon;
+	reconnectIcon.Glyph(L"\xE72C");
+
+	MenuFlyoutItem reconnectItem;
+	reconnectItem.Text(L"Reconnect");
+	reconnectItem.Icon(reconnectIcon);
+	reconnectItem.Click([](const auto&, const auto&) {
+		ReconnectAll();
+	});
+
 	FontIcon settingsIcon;
 	settingsIcon.Glyph(L"\xE713");
 
@@ -349,9 +438,14 @@ void SetupMenu()
 	});
 
 	MenuFlyout menu;
+	menu.Items().Append(reconnectItem);
 	menu.Items().Append(settingsItem);
 	menu.Items().Append(exitItem);
-	menu.Opened([](const auto& sender, const auto&) {
+	menu.Opened([reconnectItem](const auto& sender, const auto&) {
+		// Reconnecting only makes sense when there is a session to rebuild, and it must not
+		// be started again while the previous attempt is still settling.
+		reconnectItem.IsEnabled(!g_shuttingDown && !g_reconnecting && !g_audioPlaybackConnections.empty());
+
 		auto menuItems = sender.as<MenuFlyout>().Items();
 		auto itemsCount = menuItems.Size();
 		if (itemsCount > 0)
@@ -380,43 +474,60 @@ void RemoveAudioPlaybackConnection(std::wstring const& deviceId)
 		return;
 	}
 
-	AudioPlaybackConnection connection = it->second.second;
+	AudioPlaybackConnection connection = it->second.Connection;
 	g_audioPlaybackConnections.erase(it);
-	connection.Close();
+	try
+	{
+		connection.Close();
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
 }
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
-	if (g_audioPlaybackConnections.find(std::wstring(device.Id())) != g_audioPlaybackConnections.end())
+	const std::wstring deviceId(device.Id());
+	if (g_audioPlaybackConnections.find(deviceId) != g_audioPlaybackConnections.end())
 	{
 		// Already connecting or connected: reuse the existing session. Creating a second
 		// connection object would let the failure path close the old one.
 		co_return;
 	}
 
-	picker.SetDisplayStatus(device, L"Connecting", DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	SetDeviceDisplayStatus(picker, device, L"Connecting", DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
 	bool success = false;
 	std::wstring errorMessage;
+	uint64_t sessionId = 0;
 
 	try
 	{
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
-			g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+			sessionId = g_nextSessionId++;
 
-			connection.StateChanged([](const auto& sender, const auto&) {
-				if (sender.State() == AudioPlaybackConnectionState::Closed)
+			AudioPlaybackSession session;
+			session.Device = device;
+			session.Connection = connection;
+			session.Id = sessionId;
+			g_audioPlaybackConnections.emplace(deviceId, std::move(session));
+
+			connection.StateChanged([deviceId, sessionId](const auto& sender, const auto&) {
+				if (sender.State() != AudioPlaybackConnectionState::Closed)
 				{
-					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
-					if (it != g_audioPlaybackConnections.end())
-					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
-						g_audioPlaybackConnections.erase(it);
-					}
-					sender.Close();
+					return;
 				}
+
+				auto it = g_audioPlaybackConnections.find(deviceId);
+				if (it != g_audioPlaybackConnections.end() && it->second.Id == sessionId)
+				{
+					SetDeviceDisplayStatus(g_devicePicker, it->second.Device, {}, DevicePickerDisplayStatusOptions::None);
+					g_audioPlaybackConnections.erase(it);
+				}
+				sender.Close();
 			});
 
 			co_await connection.StartAsync();
@@ -467,14 +578,25 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		LOG_CAUGHT_EXCEPTION();
 	}
 
-	if (success)
+	auto it = g_audioPlaybackConnections.find(deviceId);
+	if (it != g_audioPlaybackConnections.end() && it->second.Id == sessionId)
 	{
-		picker.SetDisplayStatus(device, L"Connected", DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		if (success)
+		{
+			SetDeviceDisplayStatus(picker, device, L"Connected", DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		}
+		else
+		{
+			// Only clean up the session this call created: a late failure must not close a
+			// newer session for the same device (for example one created by ReconnectAll).
+			RemoveAudioPlaybackConnection(deviceId);
+			SetDeviceDisplayStatus(picker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		}
 	}
-	else
+	else if (!success && it == g_audioPlaybackConnections.end())
 	{
-		RemoveAudioPlaybackConnection(std::wstring(device.Id()));
-		picker.SetDisplayStatus(device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		// Do not overwrite the status of a newer session that already took over the device.
+		SetDeviceDisplayStatus(picker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
 	}
 }
 
@@ -513,7 +635,7 @@ void SetupDevicePicker()
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
 		RemoveAudioPlaybackConnection(std::wstring(device.Id()));
-		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+		SetDeviceDisplayStatus(sender, device, {}, DevicePickerDisplayStatusOptions::None);
 	});
 }
 
