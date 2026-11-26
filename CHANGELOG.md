@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 This file starts at 1.3.2. Earlier versions were released by the upstream project
 [ysc3839/AudioPlaybackConnector](https://github.com/ysc3839/AudioPlaybackConnector).
 
+## [Unreleased]
+
+### Fixed
+- The connection table was accessed from several threads without synchronization (data
+  race, undefined behavior). The UI thread was initialized as a multi-threaded apartment
+  (`winrt::init_apartment()` default), so `co_await` on WinRT async operations in
+  `ConnectDevice` and `co_await` on the captured `apartment_context` in `ReconnectAll`
+  resumed on thread-pool threads rather than the UI thread, contrary to what 1.3.4 stated;
+  and `StateChanged`, which the system raises on a background thread when the remote device
+  disconnects, erased entries directly.
+  - The UI thread is now a single-threaded apartment (as XAML Islands require), so those
+    coroutines resume on the UI thread.
+  - The `StateChanged` handler no longer touches app state: it posts
+    `WM_CONNECTIONCLOSED` with the session id, and the UI thread removes and closes the
+    matching session.
+  - Debug builds assert that the connection table is only accessed from the UI thread.
+
 ## [1.3.4] - 2026-11-22
 
 ### Added

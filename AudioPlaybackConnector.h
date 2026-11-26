@@ -15,6 +15,9 @@ constexpr wchar_t WINDOW_CLASS_NAME[] = L"AudioPlaybackConnector";
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_SHOWDEVICEPICKER = WM_APP + 3; // used by a second instance to wake the running one
+// Posted by a connection's StateChanged handler (which runs on a background thread) when the
+// connection reaches Closed. wParam is the session id; handled on the UI thread.
+constexpr UINT WM_CONNECTIONCLOSED = WM_APP + 4;
 
 // Delay between closing every connection and opening the fresh ones: Close() tears the A2DP
 // session down (the phone pauses its media), so the phone and the audio engine need a moment
@@ -29,6 +32,9 @@ constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\AudioPlaybackConnector
 HINSTANCE g_hInst;
 HWND g_hWnd;
 HWND g_hWndXaml;
+// The UI thread (an STA running the message loop) owns g_audioPlaybackConnections, the
+// device picker and the XAML objects. Only used for debug assertions.
+DWORD g_uiThreadId = 0;
 Canvas g_xamlCanvas = nullptr;
 Flyout g_xamlFlyout = nullptr;
 MenuFlyout g_xamlMenu = nullptr;
@@ -39,14 +45,18 @@ struct AudioPlaybackSession
 {
 	DeviceInformation Device{ nullptr };
 	AudioPlaybackConnection Connection{ nullptr };
-	// Identifies this session object. StateChanged is raised synchronously from Close() and
-	// can also arrive late for a connection the app already replaced; such an event (or a
-	// late failed-connect cleanup) must not remove a newer session for the same device.
-	uint64_t Id = 0;
+	// Identifies this session object. A StateChanged(Closed) notification is delivered to the
+	// UI thread asynchronously and can arrive after the app already removed or replaced the
+	// session; such a late event (or a late failed-connect cleanup) must not remove a newer
+	// session for the same device. uintptr_t so the id fits in the WPARAM of
+	// WM_CONNECTIONCLOSED; ids are only compared for equality, so wrapping on 32-bit builds
+	// (after 2^32 connections) is harmless.
+	std::uintptr_t Id = 0;
 };
 
+// Accessed from the UI thread only (see g_uiThreadId).
 std::unordered_map<std::wstring, AudioPlaybackSession> g_audioPlaybackConnections;
-uint64_t g_nextSessionId = 1;
+std::uintptr_t g_nextSessionId = 1;
 bool g_reconnecting = false;
 bool g_shuttingDown = false;
 HICON g_hIconLight = nullptr;

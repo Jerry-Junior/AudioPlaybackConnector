@@ -12,6 +12,7 @@ void UpdateNotifyIcon();
 void ShowDevicePicker();
 void ActivateExistingInstance();
 void RemoveAudioPlaybackConnection(std::wstring const& deviceId);
+void OnConnectionClosed(std::uintptr_t sessionId);
 void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options);
 winrt::fire_and_forget ReconnectAll();
 
@@ -49,7 +50,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		return EXIT_SUCCESS;
 	}
 
-	winrt::init_apartment();
+	// The UI thread must be a single-threaded apartment. XAML Islands require it, and the
+	// threading of the whole app depends on it: co_await on a WinRT async operation and
+	// co_await on a winrt::apartment_context resume in the apartment that started them. In an
+	// STA that is this thread; in the MTA (the init_apartment() default) it is any MTA thread,
+	// i.e. a thread-pool thread, which would then race with the UI thread on the connection
+	// table.
+	winrt::init_apartment(winrt::apartment_type::single_threaded);
+	g_uiThreadId = GetCurrentThreadId();
 
 	bool supported = false;
 	try
@@ -141,10 +149,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SaveSettings();
 		}
 
-		// Do not Close() while iterating the map: Close() may raise StateChanged
-		// synchronously, and the handler erases the current element, invalidating the
-		// iterator (UB). Move the table out and clear it first, so the handler's lookup
-		// always fails and it never touches the container.
+		// Detach the table before closing anything, so nothing can modify it while it is
+		// being iterated. Close() raises StateChanged synchronously; the handler only posts
+		// WM_CONNECTIONCLOSED, which is either discarded together with the window or finds
+		// the table empty, so it has no effect.
 		auto connections = std::move(g_audioPlaybackConnections);
 		g_audioPlaybackConnections.clear();
 
@@ -201,6 +209,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	case WM_SHOWDEVICEPICKER:
 		ShowDevicePicker();
+		break;
+	case WM_CONNECTIONCLOSED:
+		OnConnectionClosed(static_cast<std::uintptr_t>(wParam));
 		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
@@ -341,7 +352,9 @@ winrt::fire_and_forget ReconnectAll()
 	auto reconnectGuard = wil::scope_exit([] { g_reconnecting = false; });
 
 	// Captured on the UI thread: resume_after() resumes on a thread-pool thread, and the
-	// picker and the connection table must only be touched from the UI thread again.
+	// picker and the connection table must only be touched from the UI thread again. This
+	// only returns to the UI thread because it is an STA (see wWinMain); a context captured
+	// in the MTA would resume on any MTA thread.
 	winrt::apartment_context uiContext;
 
 	std::vector<DeviceInformation> devices;
@@ -363,6 +376,7 @@ winrt::fire_and_forget ReconnectAll()
 		// engine time to tear the old stream down before the fresh connection is opened.
 		co_await winrt::resume_after(RECONNECT_SETTLE_DELAY);
 		co_await uiContext;
+		WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
 
 		if (g_shuttingDown)
 		{
@@ -461,13 +475,15 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-// Removes the tracked session for a device and then closes it. Close() raises StateChanged
-// synchronously, and that handler also removes the entry by device id, so the entry must be
-// detached from the table before Close() is called; otherwise the handler erases it and the
-// caller's iterator is left dangling (undefined behavior: use-after-free of the map node,
-// possible heap corruption). The same hazard is documented in WM_DESTROY.
+// Removes the tracked session for a device and then closes it. The entry is detached from the
+// table before Close() is called, so the table is never modified while an iterator into it is
+// live. Close() raises StateChanged(Closed) synchronously; the handler only posts
+// WM_CONNECTIONCLOSED, and by the time that is processed the session is gone, so
+// OnConnectionClosed finds nothing to do.
 void RemoveAudioPlaybackConnection(std::wstring const& deviceId)
 {
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
 	auto it = g_audioPlaybackConnections.find(deviceId);
 	if (it == g_audioPlaybackConnections.end())
 	{
@@ -479,6 +495,41 @@ void RemoveAudioPlaybackConnection(std::wstring const& deviceId)
 	try
 	{
 		connection.Close();
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+// Handles WM_CONNECTIONCLOSED on the UI thread: a connection reached the Closed state, usually
+// because the remote device disconnected. sessionId identifies the session whose connection
+// raised the event. If the app already removed that session (disconnect button, failed
+// connect, ReconnectAll, shutdown) or replaced it with a newer one for the same device, no
+// entry matches and nothing happens.
+void OnConnectionClosed(std::uintptr_t sessionId)
+{
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
+	auto it = g_audioPlaybackConnections.begin();
+	while (it != g_audioPlaybackConnections.end() && it->second.Id != sessionId)
+	{
+		++it;
+	}
+	if (it == g_audioPlaybackConnections.end())
+	{
+		return;
+	}
+
+	AudioPlaybackSession session = std::move(it->second);
+	g_audioPlaybackConnections.erase(it);
+
+	SetDeviceDisplayStatus(g_devicePicker, session.Device, {}, DevicePickerDisplayStatusOptions::None);
+	try
+	{
+		// Release the connection's resources. If this raises StateChanged again, the posted
+		// WM_CONNECTIONCLOSED finds no session.
+		session.Connection.Close();
 	}
 	catch (winrt::hresult_error const&)
 	{
@@ -500,7 +551,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 	bool success = false;
 	std::wstring errorMessage;
-	uint64_t sessionId = 0;
+	std::uintptr_t sessionId = 0;
 
 	try
 	{
@@ -515,23 +566,24 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			session.Id = sessionId;
 			g_audioPlaybackConnections.emplace(deviceId, std::move(session));
 
-			connection.StateChanged([deviceId, sessionId](const auto& sender, const auto&) {
-				if (sender.State() != AudioPlaybackConnectionState::Closed)
+			connection.StateChanged([sessionId](const auto& sender, const auto&) {
+				// Raised on a background thread when the remote device disconnects, and
+				// synchronously on the caller's thread from Close(). Never touch app state
+				// here: hand the session id to the UI thread, which owns the connection table.
+				// g_hWnd is written once before any connection exists. If the window is
+				// already gone (shutdown), PostMessageW fails harmlessly: WM_DESTROY has
+				// closed every connection.
+				if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
-					return;
+					PostMessageW(g_hWnd, WM_CONNECTIONCLOSED, static_cast<WPARAM>(sessionId), 0);
 				}
-
-				auto it = g_audioPlaybackConnections.find(deviceId);
-				if (it != g_audioPlaybackConnections.end() && it->second.Id == sessionId)
-				{
-					SetDeviceDisplayStatus(g_devicePicker, it->second.Device, {}, DevicePickerDisplayStatusOptions::None);
-					g_audioPlaybackConnections.erase(it);
-				}
-				sender.Close();
 			});
 
 			co_await connection.StartAsync();
 			auto result = co_await connection.OpenAsync();
+			// co_await on a WinRT async operation resumes in the calling apartment, i.e. the
+			// UI thread (an STA).
+			WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
 
 			switch (result.Status())
 			{
