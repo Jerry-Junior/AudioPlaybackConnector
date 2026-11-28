@@ -23,6 +23,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>

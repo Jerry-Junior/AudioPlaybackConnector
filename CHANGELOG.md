@@ -20,7 +20,15 @@ This file starts at 1.3.2. Earlier versions were released by the upstream projec
   - The `StateChanged` handler no longer touches app state: it posts
     `WM_CONNECTIONCLOSED` with the session id, and the UI thread removes and closes the
     matching session.
+  - `DevicePicker` events (`DeviceSelected`, `DisconnectButtonClicked`,
+    `DevicePickerDismissed`) also arrive on background RPC threads, even with an STA UI
+    thread, because C++/WinRT delegates are agile. They now only queue their work, which
+    runs on the UI thread through `WM_RUNONUITHREAD`.
   - Debug builds assert that the connection table is only accessed from the UI thread.
+- The process no longer hangs on exit after the device picker was shown. Before
+  `wWinMain` returns, the UI thread now releases every WinRT object it owns (device
+  picker, XAML menu, flyout and canvas, `DesktopWindowXamlSource`, and the former
+  function-local `static CheckBox`), then calls `winrt::uninit_apartment()`.
 
 ## [1.3.4] - 2026-11-22
 

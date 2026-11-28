@@ -18,6 +18,10 @@ constexpr UINT WM_SHOWDEVICEPICKER = WM_APP + 3; // used by a second instance to
 // Posted by a connection's StateChanged handler (which runs on a background thread) when the
 // connection reaches Closed. wParam is the session id; handled on the UI thread.
 constexpr UINT WM_CONNECTIONCLOSED = WM_APP + 4;
+// Posted by PostToUiThread: drain g_uiThreadQueue on the UI thread. DevicePicker raises its
+// events on background (RPC) threads even though the UI thread is an STA, because C++/WinRT
+// delegates are agile and COM does not marshal the callbacks back.
+constexpr UINT WM_RUNONUITHREAD = WM_APP + 5;
 
 // Delay between closing every connection and opening the fresh ones: Close() tears the A2DP
 // session down (the phone pauses its media), so the phone and the audio engine need a moment
@@ -35,6 +39,13 @@ HWND g_hWndXaml;
 // The UI thread (an STA running the message loop) owns g_audioPlaybackConnections, the
 // device picker and the XAML objects. Only used for debug assertions.
 DWORD g_uiThreadId = 0;
+// Work posted from background threads by PostToUiThread and run by WM_RUNONUITHREAD. The
+// lock only guards the vector; the items themselves always run on the UI thread.
+std::mutex g_uiThreadQueueLock;
+std::vector<std::function<void()>> g_uiThreadQueue;
+// Set (under the lock) when the message loop has ended: later work is dropped so no WinRT
+// object is left in the queue to be released after the STA is gone.
+bool g_uiThreadQueueClosed = false;
 Canvas g_xamlCanvas = nullptr;
 Flyout g_xamlFlyout = nullptr;
 MenuFlyout g_xamlMenu = nullptr;

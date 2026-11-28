@@ -13,6 +13,8 @@ void ShowDevicePicker();
 void ActivateExistingInstance();
 void RemoveAudioPlaybackConnection(std::wstring const& deviceId);
 void OnConnectionClosed(std::uintptr_t sessionId);
+void PostToUiThread(std::function<void()> work);
+void RunUiThreadQueue();
 void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options);
 winrt::fire_and_forget ReconnectAll();
 
@@ -58,6 +60,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	// table.
 	winrt::init_apartment(winrt::apartment_type::single_threaded);
 	g_uiThreadId = GetCurrentThreadId();
+	// Leave the STA before returning. Declared before every WinRT local of this function, so
+	// those locals are destroyed first; the WinRT globals are released explicitly after the
+	// message loop. Without this, a process that had shown the DevicePicker hangs after
+	// wWinMain returns instead of exiting.
+	auto apartmentGuard = wil::scope_exit([] { winrt::uninit_apartment(); });
 
 	bool supported = false;
 	try
@@ -129,6 +136,34 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 			DispatchMessageW(&msg);
 		}
 	}
+
+	// Release every WinRT object owned by the UI thread while the STA is still alive. Globals
+	// would otherwise be destroyed by the CRT after wWinMain returns, i.e. after
+	// uninit_apartment (or, without it, in a torn-down apartment), which hangs the process.
+	std::vector<std::function<void()>> pendingWork;
+	{
+		std::lock_guard lock(g_uiThreadQueueLock);
+		g_uiThreadQueueClosed = true; // late DevicePicker events are dropped from now on
+		pendingWork.swap(g_uiThreadQueue);
+	}
+	pendingWork.clear();
+
+	g_devicePicker = nullptr;
+	g_xamlMenu = nullptr;
+	g_xamlFlyout = nullptr;
+	try
+	{
+		desktopSource.Content(nullptr);
+	}
+	CATCH_LOG();
+	g_xamlCanvas = nullptr;
+	desktopSourceNative2 = nullptr;
+	try
+	{
+		desktopSource.Close();
+	}
+	CATCH_LOG();
+	desktopSource = nullptr;
 
 	return static_cast<int>(msg.wParam);
 }
@@ -212,6 +247,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	case WM_CONNECTIONCLOSED:
 		OnConnectionClosed(static_cast<std::uintptr_t>(wParam));
+		break;
+	case WM_RUNONUITHREAD:
+		RunUiThreadQueue();
 		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
@@ -299,14 +337,16 @@ void SetupFlyout()
 	textBlock.Text(L"All connections will be closed.\nExit anyway?");
 	textBlock.Margin({ 0, 0, 0, 12 });
 
-	static CheckBox checkbox;
+	// Not static: a function-local static would be released by the CRT after the STA is
+	// gone. The Click handler holds its own reference, released together with the flyout.
+	CheckBox checkbox;
 	checkbox.IsChecked(g_reconnect);
 	checkbox.Content(winrt::box_value(L"Reconnect on next start"));
 
 	Button button;
 	button.Content(winrt::box_value(L"Exit"));
 	button.HorizontalAlignment(HorizontalAlignment::Right);
-	button.Click([](const auto&, const auto&) {
+	button.Click([checkbox](const auto&, const auto&) {
 		g_reconnect = checkbox.IsChecked().Value();
 		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 	});
@@ -537,8 +577,49 @@ void OnConnectionClosed(std::uintptr_t sessionId)
 	}
 }
 
+// Runs work on the UI thread. Safe to call from any thread and never blocks: the item is
+// queued and WM_RUNONUITHREAD is posted. Used for DevicePicker events, which arrive on
+// background threads. Work posted after the message loop has ended is dropped.
+void PostToUiThread(std::function<void()> work)
+{
+	{
+		std::lock_guard lock(g_uiThreadQueueLock);
+		if (g_uiThreadQueueClosed)
+		{
+			return;
+		}
+		g_uiThreadQueue.push_back(std::move(work));
+	}
+	// If posting fails, the item stays queued and runs with the next successful post.
+	LOG_IF_WIN32_BOOL_FALSE(PostMessageW(g_hWnd, WM_RUNONUITHREAD, 0, 0));
+}
+
+// Handles WM_RUNONUITHREAD: runs every queued item on the UI thread.
+void RunUiThreadQueue()
+{
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
+	// Take the whole batch first: an item may post more work or re-enter the message loop.
+	std::vector<std::function<void()>> work;
+	{
+		std::lock_guard lock(g_uiThreadQueueLock);
+		work.swap(g_uiThreadQueue);
+	}
+	for (auto& item : work)
+	{
+		try
+		{
+			item();
+		}
+		CATCH_LOG(); // an exception must not escape WndProc
+	}
+}
+
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
+	// Must start on the UI thread: the co_awaits below resume in the calling apartment.
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
 	const std::wstring deviceId(device.Id());
 	if (g_audioPlaybackConnections.find(deviceId) != g_audioPlaybackConnections.end())
 	{
@@ -654,6 +735,9 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
 {
+	// Must start on the UI thread: the co_await below resumes in the calling apartment.
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
 	DeviceInformation device = nullptr;
 	try
 	{
@@ -678,16 +762,26 @@ void SetupDevicePicker()
 	winrt::check_hresult(g_devicePicker.as<IInitializeWithWindow>()->Initialize(g_hWnd));
 
 	g_devicePicker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
+
+	// DevicePicker raises these events on background (RPC) threads, not on the UI thread,
+	// even though the UI thread is an STA: C++/WinRT delegates are agile, so COM does not
+	// marshal the calls back. Read what is needed from the event args here, then do the
+	// actual work on the UI thread, which owns the connection table and the window.
 	g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
-		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+		PostToUiThread([] {
+			SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+		});
 	});
-	g_devicePicker.DeviceSelected([](const auto& sender, const auto& args) {
-		ConnectDevice(sender, args.SelectedDevice());
+	g_devicePicker.DeviceSelected([](const auto&, const auto& args) {
+		PostToUiThread([device = args.SelectedDevice()] {
+			ConnectDevice(g_devicePicker, device);
+		});
 	});
-	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
-		auto device = args.Device();
-		RemoveAudioPlaybackConnection(std::wstring(device.Id()));
-		SetDeviceDisplayStatus(sender, device, {}, DevicePickerDisplayStatusOptions::None);
+	g_devicePicker.DisconnectButtonClicked([](const auto&, const auto& args) {
+		PostToUiThread([device = args.Device()] {
+			RemoveAudioPlaybackConnection(std::wstring(device.Id()));
+			SetDeviceDisplayStatus(g_devicePicker, device, {}, DevicePickerDisplayStatusOptions::None);
+		});
 	});
 }
 
