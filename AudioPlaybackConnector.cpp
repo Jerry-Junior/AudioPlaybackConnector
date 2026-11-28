@@ -4,8 +4,8 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
-winrt::fire_and_forget ConnectDevice(DevicePicker, DeviceInformation);
+winrt::fire_and_forget ConnectDevice(std::wstring);
+winrt::fire_and_forget ConnectDevice(DeviceInformation);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -15,6 +15,7 @@ void RemoveAudioPlaybackConnection(std::wstring const& deviceId);
 void OnConnectionClosed(std::uintptr_t sessionId);
 void PostToUiThread(std::function<void()> work);
 void RunUiThreadQueue();
+void CloseUiThreadQueue();
 void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options);
 winrt::fire_and_forget ReconnectAll();
 
@@ -140,15 +141,22 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	// Release every WinRT object owned by the UI thread while the STA is still alive. Globals
 	// would otherwise be destroyed by the CRT after wWinMain returns, i.e. after
 	// uninit_apartment (or, without it, in a torn-down apartment), which hangs the process.
-	std::vector<std::function<void()>> pendingWork;
-	{
-		std::lock_guard lock(g_uiThreadQueueLock);
-		g_uiThreadQueueClosed = true; // late DevicePicker events are dropped from now on
-		pendingWork.swap(g_uiThreadQueue);
-	}
-	pendingWork.clear();
+	// Note that desktopSource.Close() pumps STA messages and can resume in-flight coroutines;
+	// g_shuttingDown stops those coroutines from touching app state or starting new work.
+	g_shuttingDown = true;
+	CloseUiThreadQueue();
 
-	g_devicePicker = nullptr;
+	if (g_devicePicker)
+	{
+		try
+		{
+			g_devicePicker.DevicePickerDismissed(g_pickerDismissedToken);
+			g_devicePicker.DeviceSelected(g_pickerSelectedToken);
+			g_devicePicker.DisconnectButtonClicked(g_pickerDisconnectToken);
+		}
+		CATCH_LOG();
+		g_devicePicker = nullptr;
+	}
 	g_xamlMenu = nullptr;
 	g_xamlFlyout = nullptr;
 	try
@@ -165,6 +173,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	CATCH_LOG();
 	desktopSource = nullptr;
 
+	WI_ASSERT(g_audioPlaybackConnections.empty());
 	return static_cast<int>(msg.wParam);
 }
 
@@ -174,9 +183,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 	{
-		// Stop a pending reconnect from touching the app state once shutdown has started.
+		// Stop pending reconnects, in-flight connects and queued picker callbacks from
+		// touching app state once shutdown has started: Close() and XAML teardown can pump
+		// STA messages before wWinMain returns.
 		g_shuttingDown = true;
 		g_reconnecting = false;
+		CloseUiThreadQueue();
 
 		// In reconnect mode save first: SaveSettings reads the device ids from the table.
 		if (g_reconnect)
@@ -186,14 +198,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		// Detach the table before closing anything, so nothing can modify it while it is
 		// being iterated. Close() raises StateChanged synchronously; the handler only posts
-		// WM_CONNECTIONCLOSED, which is either discarded together with the window or finds
-		// the table empty, so it has no effect.
+		// WM_CONNECTIONCLOSED, which is either discarded together with the window or ignored
+		// because g_shuttingDown is set.
 		auto connections = std::move(g_audioPlaybackConnections);
 		g_audioPlaybackConnections.clear();
 
 		for (auto& connection : connections)
 		{
-			connection.second.Connection.Close();
+			try
+			{
+				connection.second.Connection.Close();
+			}
+			catch (winrt::hresult_error const&)
+			{
+				LOG_CAUGHT_EXCEPTION();
+			}
 			SetDeviceDisplayStatus(g_devicePicker, connection.second.Device, {}, DevicePickerDisplayStatusOptions::None);
 		}
 
@@ -207,12 +226,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 	case WM_SETTINGCHANGE:
-		if (lParam && CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL)
+		if (!g_shuttingDown && lParam && CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL)
 		{
 			UpdateNotifyIcon();
 		}
 		break;
 	case WM_NOTIFYICON:
+		if (g_shuttingDown)
+		{
+			break;
+		}
 		switch (LOWORD(lParam))
 		{
 		case NIN_SELECT:
@@ -252,17 +275,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		RunUiThreadQueue();
 		break;
 	case WM_CONNECTDEVICE:
-		if (g_reconnect)
+		if (!g_shuttingDown && g_reconnect)
 		{
-			for (const auto& i : g_lastDevices)
+			for (auto& i : g_lastDevices)
 			{
-				ConnectDevice(g_devicePicker, i);
+				ConnectDevice(std::move(i));
 			}
 			g_lastDevices.clear();
 		}
 		break;
 	default:
-		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
+		if (!g_shuttingDown && WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
 		{
 			UpdateNotifyIcon();
 		}
@@ -273,6 +296,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 void ShowDevicePicker()
 {
+	if (g_shuttingDown || !g_devicePicker)
+	{
+		return;
+	}
+
 	using namespace winrt::Windows::UI::Popups;
 
 	RECT iconRect;
@@ -365,8 +393,14 @@ void SetupFlyout()
 
 void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, std::wstring_view status, DevicePickerDisplayStatusOptions options)
 {
-	// The picker is agile, but a throwing status update must not escape a fire_and_forget
-	// coroutine: an unhandled hresult_error there terminates the process.
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (!picker)
+	{
+		return;
+	}
+
+	// A throwing status update must not escape a fire_and_forget coroutine or WndProc: an
+	// unhandled hresult_error there terminates the process.
 	try
 	{
 		picker.SetDisplayStatus(device, winrt::hstring(status), options);
@@ -383,13 +417,19 @@ void SetDeviceDisplayStatus(DevicePicker const& picker, DeviceInformation const&
 // and the reconnect starts a completely fresh one whose stream reaches the output device.
 winrt::fire_and_forget ReconnectAll()
 {
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
 	if (g_shuttingDown || g_reconnecting || g_audioPlaybackConnections.empty())
 	{
 		co_return;
 	}
 
 	g_reconnecting = true;
-	auto reconnectGuard = wil::scope_exit([] { g_reconnecting = false; });
+	auto reconnectGuard = wil::scope_exit([] {
+		if (GetCurrentThreadId() == g_uiThreadId)
+		{
+			g_reconnecting = false;
+		}
+	});
 
 	// Captured on the UI thread: resume_after() resumes on a thread-pool thread, and the
 	// picker and the connection table must only be touched from the UI thread again. This
@@ -415,6 +455,10 @@ winrt::fire_and_forget ReconnectAll()
 		// Give the phone time to notice the disconnect (and pause its media) and the audio
 		// engine time to tear the old stream down before the fresh connection is opened.
 		co_await winrt::resume_after(RECONNECT_SETTLE_DELAY);
+		if (g_shuttingDown)
+		{
+			co_return;
+		}
 		co_await uiContext;
 		WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
 
@@ -425,7 +469,7 @@ winrt::fire_and_forget ReconnectAll()
 
 		for (const auto& device : devices)
 		{
-			ConnectDevice(g_devicePicker, device);
+			ConnectDevice(device);
 		}
 	}
 	catch (winrt::hresult_error const&)
@@ -509,7 +553,10 @@ void SetupMenu()
 		g_menuFocusState = FocusState::Unfocused;
 	});
 	menu.Closed([](const auto&, const auto&) {
-		ShowWindow(g_hWnd, SW_HIDE);
+		if (!g_shuttingDown)
+		{
+			ShowWindow(g_hWnd, SW_HIDE);
+		}
 	});
 
 	g_xamlMenu = menu;
@@ -550,6 +597,10 @@ void RemoveAudioPlaybackConnection(std::wstring const& deviceId)
 void OnConnectionClosed(std::uintptr_t sessionId)
 {
 	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (g_shuttingDown)
+	{
+		return;
+	}
 
 	auto it = g_audioPlaybackConnections.begin();
 	while (it != g_audioPlaybackConnections.end() && it->second.Id != sessionId)
@@ -579,7 +630,7 @@ void OnConnectionClosed(std::uintptr_t sessionId)
 
 // Runs work on the UI thread. Safe to call from any thread and never blocks: the item is
 // queued and WM_RUNONUITHREAD is posted. Used for DevicePicker events, which arrive on
-// background threads. Work posted after the message loop has ended is dropped.
+// background threads. Work posted once shutdown has started is dropped.
 void PostToUiThread(std::function<void()> work)
 {
 	{
@@ -590,7 +641,8 @@ void PostToUiThread(std::function<void()> work)
 		}
 		g_uiThreadQueue.push_back(std::move(work));
 	}
-	// If posting fails, the item stays queued and runs with the next successful post.
+	// If posting fails, the item stays queued and runs with the next successful post (or is
+	// discarded by CloseUiThreadQueue on shutdown).
 	LOG_IF_WIN32_BOOL_FALSE(PostMessageW(g_hWnd, WM_RUNONUITHREAD, 0, 0));
 }
 
@@ -598,6 +650,10 @@ void PostToUiThread(std::function<void()> work)
 void RunUiThreadQueue()
 {
 	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (g_shuttingDown)
+	{
+		return;
+	}
 
 	// Take the whole batch first: an item may post more work or re-enter the message loop.
 	std::vector<std::function<void()>> work;
@@ -607,6 +663,10 @@ void RunUiThreadQueue()
 	}
 	for (auto& item : work)
 	{
+		if (g_shuttingDown)
+		{
+			break;
+		}
 		try
 		{
 			item();
@@ -615,10 +675,31 @@ void RunUiThreadQueue()
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
+// Stops accepting background work and discards anything still queued on the UI thread, so
+// captured WinRT objects are released while the STA is still alive.
+void CloseUiThreadQueue()
+{
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+
+	std::vector<std::function<void()>> pendingWork;
+	{
+		std::lock_guard lock(g_uiThreadQueueLock);
+		g_uiThreadQueueClosed = true;
+		pendingWork.swap(g_uiThreadQueue);
+	}
+	pendingWork.clear();
+}
+
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	// Must start on the UI thread: the co_awaits below resume in the calling apartment.
+	// Does not take DevicePicker as a parameter: a suspended coroutine frame would keep
+	// that STA-bound reference alive past g_devicePicker = nullptr on exit.
 	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (g_shuttingDown || !g_devicePicker)
+	{
+		co_return;
+	}
 
 	const std::wstring deviceId(device.Id());
 	if (g_audioPlaybackConnections.find(deviceId) != g_audioPlaybackConnections.end())
@@ -628,7 +709,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		co_return;
 	}
 
-	SetDeviceDisplayStatus(picker, device, L"Connecting", DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	SetDeviceDisplayStatus(g_devicePicker, device, L"Connecting", DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
 	bool success = false;
 	std::wstring errorMessage;
@@ -639,6 +720,12 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
+			if (g_shuttingDown)
+			{
+				connection.Close();
+				co_return;
+			}
+
 			sessionId = g_nextSessionId++;
 
 			AudioPlaybackSession session;
@@ -661,10 +748,29 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			});
 
 			co_await connection.StartAsync();
-			auto result = co_await connection.OpenAsync();
 			// co_await on a WinRT async operation resumes in the calling apartment, i.e. the
-			// UI thread (an STA).
+			// UI thread (an STA). This can also happen inside desktopSource.Close(), which
+			// pumps STA messages during shutdown; bail out immediately in that case.
 			WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+			if (g_shuttingDown)
+			{
+				co_return;
+			}
+			{
+				auto sessionIt = g_audioPlaybackConnections.find(deviceId);
+				if (sessionIt == g_audioPlaybackConnections.end() || sessionIt->second.Id != sessionId)
+				{
+					// Disconnected or replaced while StartAsync was in flight.
+					co_return;
+				}
+			}
+
+			auto result = co_await connection.OpenAsync();
+			WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+			if (g_shuttingDown)
+			{
+				co_return;
+			}
 
 			switch (result.Status())
 			{
@@ -693,6 +799,15 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	}
 	catch (winrt::hresult_error const& ex)
 	{
+		LOG_CAUGHT_EXCEPTION();
+		// Closing connections on shutdown aborts StartAsync/OpenAsync (and if the STA has
+		// already uninitialized, await_resume() throws on a thread-pool thread). Never touch
+		// UI-thread state once shutdown has started.
+		if (g_shuttingDown || GetCurrentThreadId() != g_uiThreadId)
+		{
+			co_return;
+		}
+
 		success = false;
 		errorMessage.resize(64);
 		while (1)
@@ -708,7 +823,24 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				break;
 			}
 		}
+	}
+	catch (...)
+	{
+		// A fire_and_forget coroutine must not let any exception escape.
 		LOG_CAUGHT_EXCEPTION();
+		if (g_shuttingDown || GetCurrentThreadId() != g_uiThreadId)
+		{
+			co_return;
+		}
+
+		success = false;
+		errorMessage = L"Unknown error";
+	}
+
+	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (g_shuttingDown)
+	{
+		co_return;
 	}
 
 	auto it = g_audioPlaybackConnections.find(deviceId);
@@ -716,43 +848,58 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	{
 		if (success)
 		{
-			SetDeviceDisplayStatus(picker, device, L"Connected", DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+			SetDeviceDisplayStatus(g_devicePicker, device, L"Connected", DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 		}
 		else
 		{
 			// Only clean up the session this call created: a late failure must not close a
 			// newer session for the same device (for example one created by ReconnectAll).
 			RemoveAudioPlaybackConnection(deviceId);
-			SetDeviceDisplayStatus(picker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+			SetDeviceDisplayStatus(g_devicePicker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
 		}
 	}
 	else if (!success && it == g_audioPlaybackConnections.end())
 	{
 		// Do not overwrite the status of a newer session that already took over the device.
-		SetDeviceDisplayStatus(picker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		SetDeviceDisplayStatus(g_devicePicker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
 	// Must start on the UI thread: the co_await below resumes in the calling apartment.
 	WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
+	if (g_shuttingDown)
+	{
+		co_return;
+	}
 
 	DeviceInformation device = nullptr;
 	try
 	{
 		device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+		WI_ASSERT(GetCurrentThreadId() == g_uiThreadId);
 	}
 	catch (winrt::hresult_error const&)
 	{
-		// The device may have been removed or unpaired; the exception must not escape a
-		// fire_and_forget coroutine (that terminates the process).
+		// The device may have been removed or unpaired, or the STA may have torn down on
+		// exit; the exception must not escape a fire_and_forget coroutine (that terminates
+		// the process).
 		LOG_CAUGHT_EXCEPTION();
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+
+	if (g_shuttingDown || GetCurrentThreadId() != g_uiThreadId)
+	{
+		co_return;
 	}
 
 	if (device)
 	{
-		ConnectDevice(picker, device);
+		ConnectDevice(device);
 	}
 }
 
@@ -767,20 +914,26 @@ void SetupDevicePicker()
 	// even though the UI thread is an STA: C++/WinRT delegates are agile, so COM does not
 	// marshal the calls back. Read what is needed from the event args here, then do the
 	// actual work on the UI thread, which owns the connection table and the window.
-	g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
+	g_pickerDismissedToken = g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
 		PostToUiThread([] {
-			SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+			if (!g_shuttingDown)
+			{
+				SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+			}
 		});
 	});
-	g_devicePicker.DeviceSelected([](const auto&, const auto& args) {
+	g_pickerSelectedToken = g_devicePicker.DeviceSelected([](const auto&, const auto& args) {
 		PostToUiThread([device = args.SelectedDevice()] {
-			ConnectDevice(g_devicePicker, device);
+			ConnectDevice(device);
 		});
 	});
-	g_devicePicker.DisconnectButtonClicked([](const auto&, const auto& args) {
+	g_pickerDisconnectToken = g_devicePicker.DisconnectButtonClicked([](const auto&, const auto& args) {
 		PostToUiThread([device = args.Device()] {
-			RemoveAudioPlaybackConnection(std::wstring(device.Id()));
-			SetDeviceDisplayStatus(g_devicePicker, device, {}, DevicePickerDisplayStatusOptions::None);
+			if (!g_shuttingDown)
+			{
+				RemoveAudioPlaybackConnection(std::wstring(device.Id()));
+				SetDeviceDisplayStatus(g_devicePicker, device, {}, DevicePickerDisplayStatusOptions::None);
+			}
 		});
 	});
 }
@@ -808,6 +961,11 @@ void SetupSvgIcon()
 
 void UpdateNotifyIcon()
 {
+	if (g_shuttingDown)
+	{
+		return;
+	}
+
 	DWORD value = 0, cbValue = sizeof(value);
 	LOG_IF_WIN32_ERROR(RegGetValueW(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &cbValue));
 	g_nid.hIcon = value != 0 ? g_hIconLight : g_hIconDark;

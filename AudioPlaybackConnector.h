@@ -37,20 +37,23 @@ HINSTANCE g_hInst;
 HWND g_hWnd;
 HWND g_hWndXaml;
 // The UI thread (an STA running the message loop) owns g_audioPlaybackConnections, the
-// device picker and the XAML objects. Only used for debug assertions.
+// device picker and the XAML objects. Used for thread assertions and shutdown checks.
 DWORD g_uiThreadId = 0;
 // Work posted from background threads by PostToUiThread and run by WM_RUNONUITHREAD. The
 // lock only guards the vector; the items themselves always run on the UI thread.
 std::mutex g_uiThreadQueueLock;
 std::vector<std::function<void()>> g_uiThreadQueue;
-// Set (under the lock) when the message loop has ended: later work is dropped so no WinRT
-// object is left in the queue to be released after the STA is gone.
+// Set (under the lock) once shutdown starts: later work is dropped so no WinRT object is
+// left in the queue to be released after the STA is gone.
 bool g_uiThreadQueueClosed = false;
 Canvas g_xamlCanvas = nullptr;
 Flyout g_xamlFlyout = nullptr;
 MenuFlyout g_xamlMenu = nullptr;
 FocusState g_menuFocusState = FocusState::Unfocused;
 DevicePicker g_devicePicker = nullptr;
+winrt::event_token g_pickerDismissedToken{};
+winrt::event_token g_pickerSelectedToken{};
+winrt::event_token g_pickerDisconnectToken{};
 
 struct AudioPlaybackSession
 {
@@ -69,7 +72,9 @@ struct AudioPlaybackSession
 std::unordered_map<std::wstring, AudioPlaybackSession> g_audioPlaybackConnections;
 std::uintptr_t g_nextSessionId = 1;
 bool g_reconnecting = false;
-bool g_shuttingDown = false;
+// Atomic because a coroutine may read it on a thread-pool thread (after resume_after, or in a
+// catch block if switching back to the STA fails after uninit_apartment).
+std::atomic<bool> g_shuttingDown{ false };
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
 NOTIFYICONDATAW g_nid = {

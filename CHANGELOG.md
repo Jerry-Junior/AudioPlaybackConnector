@@ -25,10 +25,16 @@ This file starts at 1.3.2. Earlier versions were released by the upstream projec
     thread, because C++/WinRT delegates are agile. They now only queue their work, which
     runs on the UI thread through `WM_RUNONUITHREAD`.
   - Debug builds assert that the connection table is only accessed from the UI thread.
-- The process no longer hangs on exit after the device picker was shown. Before
-  `wWinMain` returns, the UI thread now releases every WinRT object it owns (device
-  picker, XAML menu, flyout and canvas, `DesktopWindowXamlSource`, and the former
-  function-local `static CheckBox`), then calls `winrt::uninit_apartment()`.
+- The process no longer hangs on exit after the device picker was shown, or races when
+  exiting while a connection is still being established:
+  - Before `wWinMain` returns, the UI thread revokes the `DevicePicker` handlers, releases
+    every WinRT object it owns (device picker, XAML menu, flyout and canvas,
+    `DesktopWindowXamlSource`, and the former function-local `static CheckBox`), and calls
+    `winrt::uninit_apartment()`.
+  - `ConnectDevice` no longer captures `DevicePicker` in its coroutine frame (so an
+    in-flight async operation cannot keep the picker alive past teardown) and bails out on
+    `g_shuttingDown` at every resume point, including when `DesktopWindowXamlSource::Close()`
+    pumps STA messages during shutdown.
 
 ## [1.3.4] - 2026-11-22
 

@@ -20,6 +20,7 @@
 #include <shlwapi.h>
 
 // C++ RunTime Header Files
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
